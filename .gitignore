@@ -1,0 +1,8 @@
+.venv/
+data/
+*.pth
+__pycache__/
+*.pyc
+temp_*.jpg
+error_analysis_*/
+.DS_Store
