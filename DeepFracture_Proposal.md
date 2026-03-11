@@ -1,4 +1,4 @@
-# DeepFracture: A Research Proposal
+# Readme
 
 ## 1. TITLE
 **DeepFracture: An Explainable and Risk-Aware Deep Learning Framework for Bone Fracture Detection and Structural Assessment from Radiographs**
