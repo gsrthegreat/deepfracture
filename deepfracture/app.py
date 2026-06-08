@@ -6,9 +6,19 @@ import os
 import cv2
 import numpy as np
 
-from model import DeepFractureModel, BaselineCNN
-from utils import get_transforms, extract_image_features
-from gradcam import GradCAM, overlay_heatmap
+from model import DeepFractureModel, BaselineCNN, DenseFractureModel
+from utils import (
+    prepare_model_input,
+    extract_image_features,
+    compute_localized_edge_score,
+    refine_fracture_prediction,
+)
+from gradcam import (
+    GradCAM,
+    overlay_heatmap_on_rgb,
+    map_cam_to_original,
+    get_gradcam_target_layer,
+)
 from risk_model import RiskStratificationModel
 
 st.set_page_config(
@@ -30,31 +40,48 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+def load_inference_threshold(model_key, default=0.58):
+    path = f'threshold_{model_key}.txt'
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            saved = float(f.read().strip())
+        return max(saved, 0.55)
+    return default
+
+
 @st.cache_resource
-def load_models(model_type, _cache_buster="v2"):
+def load_models(model_type, _cache_buster="v7"):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    
-    if 'ResNet50' in model_type:
+
+    if 'DenseNet' in model_type:
+        model = DenseFractureModel(num_classes=2, freeze_layers=True)
+        model_key = 'densenet'
+    elif 'ResNet50' in model_type:
         model = DeepFractureModel(num_classes=2, freeze_layers=True)
-        weight_path = 'best_resnet.pth'
+        model_key = 'resnet'
     else:
         model = BaselineCNN(num_classes=2)
-        weight_path = 'best_baseline.pth'
-        
+        model_key = 'baseline'
+
+    weight_path = f'best_{model_key}.pth'
     if os.path.exists(weight_path):
         model.load_state_dict(torch.load(weight_path, map_location=device))
-    
+
     model.to(device)
     model.eval()
-    
+
     risk_model = RiskStratificationModel()
-    return model, risk_model, device
+    threshold = load_inference_threshold(model_key)
+    return model, risk_model, device, model_key, threshold
 
 def main():
     st.markdown("<div class='main-header'>🦴 DeepFracture: XAI & Risk-Aware Framework</div>", unsafe_allow_html=True)
     
     st.sidebar.title("Research Settings")
-    model_choice = st.sidebar.radio("Select Model Architecture:", ['ResNet50 (Transfer Learning)', 'Baseline CNN (Scratch)'])
+    model_choice = st.sidebar.radio(
+        "Select Model Architecture:",
+        ['DenseNet169 (Transfer Learning)', 'ResNet50 (Transfer Learning)', 'Baseline CNN (Scratch)']
+    )
     
     st.sidebar.info("""
     **DeepFracture (Research Edition)** integrates:
@@ -63,14 +90,11 @@ def main():
     3. **Structural Risk**: Random Forest over GLCM, Density, Intensity features.
     """)
     
-    model, risk_model, device = load_models(model_choice)
-    # Target layer logic
-    if 'ResNet50' in model_choice:
-        target_layer = model.resnet.layer4[-1]
-    else:
-        target_layer = model.features[-3] # Last Conv's output
-        
-    classes = ['Fractured', 'Normal'] 
+    model, risk_model, device, model_key, fracture_threshold = load_models(model_choice)
+    target_layer = get_gradcam_target_layer(model, model_key)
+
+    classes = ['Fractured', 'Normal']
+    pos_idx = 0
     
     tab1, tab2, tab3 = st.tabs(["🩺 Diagnosis", "📊 Performance Metrics", "🧠 XAI Details"])
     
@@ -85,35 +109,52 @@ def main():
             image.save(temp_img_path)
             
             with col1:
-                st.image(image, caption="Uploaded X-Ray", use_container_width=True)
+                st.image(image, caption="Uploaded X-Ray", width="stretch")
                 
-            transform = get_transforms(is_train=False)
-            input_tensor = transform(image).unsqueeze(0).to(device)
-            
+            input_tensor, model_view_rgb = prepare_model_input(image)
+            input_tensor = input_tensor.unsqueeze(0).to(device)
+
             with st.spinner(f'Running framework using {model_choice}...'):
                 with torch.no_grad():
                     output = model(input_tensor)
-                    probs = F.softmax(output, dim=1)
-                    conf_score, pred_class = torch.max(probs, 1)
-                    pred_label = classes[pred_class.item()]
-                    conf_val = conf_score.item()
-                    
-                # XAI (Grad-CAM depends on architecture)
+                    # Temperature scaling reduces over-confidence on out-of-distribution X-rays
+                    temperature = 1.6 if model_key in ('resnet', 'densenet') else 1.0
+                    probs = F.softmax(output / temperature, dim=1)
+                    fracture_prob = probs[0, pos_idx].item()
+
+                _, _, edge_localization = compute_localized_edge_score(temp_img_path)
+                is_fractured = refine_fracture_prediction(
+                    fracture_prob, fracture_threshold, edge_localization)
+                pred_class = pos_idx if is_fractured else 1 - pos_idx
+                pred_label = classes[pred_class]
+                conf_val = fracture_prob if is_fractured else 1.0 - fracture_prob
+
                 grad_cam = GradCAM(model, target_layer)
-                heatmap, _ = grad_cam.generate_heatmap(input_tensor, target_class=pred_class.item())
+                cam_target = pos_idx if is_fractured else pred_class
+                heatmap, _ = grad_cam.generate_heatmap(input_tensor, target_class=cam_target)
+
+                model_overlay_path = f"heatmap_model_{pred_label}.jpg"
+                overlay_heatmap_on_rgb(
+                    model_view_rgb, heatmap, save_path=model_overlay_path)
+
+                orig_rgb = np.array(image.convert('RGB'))
+                cam_on_orig = map_cam_to_original(
+                    heatmap, orig_rgb.shape[1], orig_rgb.shape[0])
                 heatmap_path = f"heatmap_{pred_label}.jpg"
-                overlay_heatmap(temp_img_path, heatmap, save_path=heatmap_path)
-                
-                # Risk Module
-                mean_int, std_dev, edge_density, contrast, homogeneity = extract_image_features(temp_img_path)
-                fracture_prob = probs[0][0].item() if classes[0] == 'Fractured' else probs[0][1].item()
-                risk_category = risk_model.predict_risk(fracture_prob, mean_int, std_dev, edge_density, contrast, homogeneity)
+                overlay_heatmap_on_rgb(
+                    orig_rgb, cam_on_orig, save_path=heatmap_path)
+
+                mean_int, std_dev, edge_density, contrast, homogeneity = extract_image_features(
+                    temp_img_path)
+                risk_category = risk_model.predict_risk(
+                    fracture_prob, mean_int, std_dev, edge_density, contrast, homogeneity)
                 
             with col2:
                 st.markdown(f"""
                 <div class="prediction-box">
                     <h4>Diagnosis: <strong>{pred_label}</strong></h4>
                     <p>Confidence: <strong>{conf_val:.2%}</strong></p>
+                    <p>Fracture probability: <strong>{fracture_prob:.2%}</strong> (threshold {fracture_threshold:.2f})</p>
                     <progress value="{conf_val}" max="1" style="width: 100%;"></progress>
                 </div>
                 """, unsafe_allow_html=True)
@@ -128,29 +169,39 @@ def main():
                     st.write(f"- GLCM Contrast: **{contrast:.2f}**")
                     st.write(f"- GLCM Homogeneity: **{homogeneity:.4f}**")
                     st.write(f"- Edge Density: **{edge_density:.4f}**")
+                    st.write(f"- Edge Localisation Ratio: **{edge_localization:.2f}**")
                     st.write(f"- Intensity (Mean / Std): **{mean_int:.1f} / {std_dev:.1f}**")
                 
             st.write("---")
             st.write("### Explainable AI (Grad-CAM)")
-            hcol1, hcol2 = st.columns(2)
+            hcol1, hcol2, hcol3 = st.columns(3)
             with hcol1:
-                st.image(image, caption="Original", use_container_width=True)
+                st.image(image, caption="Original upload", width="stretch")
             with hcol2:
-                st.image(heatmap_path, caption=f"Grad-CAM Heatmap via {model_choice}", use_container_width=True)
+                st.image(model_overlay_path,
+                         caption="Model view (224×224, aligned heatmap)", width="stretch")
+            with hcol3:
+                st.image(heatmap_path,
+                         caption="Mapped to original dimensions", width="stretch")
                 
             if os.path.exists(temp_img_path): os.remove(temp_img_path)
 
     with tab2:
-        model_key = 'resnet' if 'ResNet50' in model_choice else 'baseline'
+        if 'DenseNet' in model_choice:
+            model_key = 'densenet'
+        elif 'ResNet50' in model_choice:
+            model_key = 'resnet'
+        else:
+            model_key = 'baseline'
         st.write(f"### Performance Dashboard ({model_choice})")
         
         col_cm, col_roc = st.columns(2)
         has_metrics = False
         if os.path.exists(f'confusion_matrix_{model_key}.png'):
-            col_cm.image(f'confusion_matrix_{model_key}.png', caption="Confusion Matrix", use_container_width=True)
+            col_cm.image(f'confusion_matrix_{model_key}.png', caption="Confusion Matrix", width="stretch")
             has_metrics = True
         if os.path.exists(f'roc_curve_{model_key}.png'):
-            col_roc.image(f'roc_curve_{model_key}.png', caption="ROC Curve", use_container_width=True)
+            col_roc.image(f'roc_curve_{model_key}.png', caption="ROC Curve", width="stretch")
             has_metrics = True
             
         if not has_metrics:
@@ -163,7 +214,7 @@ def main():
             err_files = os.listdir(error_dir)[:5] # Show max 5
             cols = st.columns(len(err_files))
             for i, f in enumerate(err_files):
-                cols[i].image(os.path.join(error_dir, f), caption=f, use_container_width=True)
+                cols[i].image(os.path.join(error_dir, f), caption=f, width="stretch")
             st.write("**Possible Reasons for Misclassification:** Ambiguous fracture lines, poor contrast, overlapping bone structures, or foreign artifacts (implants/casts) disrupting the texture features.")
         else:
             st.write("No error analysis logs found yet.")
