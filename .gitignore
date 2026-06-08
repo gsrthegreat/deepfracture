@@ -1,6 +1,5 @@
 .venv/
 data/
-*.pth
 __pycache__/
 *.pyc
 temp_*.jpg
