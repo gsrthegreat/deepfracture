@@ -6,12 +6,19 @@ import matplotlib.pyplot as plt
 
 
 def get_gradcam_target_layer(model, model_key):
-    """Return a spatially detailed layer for sharper Grad-CAM localisation."""
+    """
+    Return the LAST spatial convolutional block for each architecture.
+    Using the final feature layer (not mid-network) gives the sharpest,
+    most semantically meaningful Grad-CAM localisation.
+    """
     if model_key == 'densenet':
-        return model.backbone.features.denseblock3
+        # Final dense block before norm5 + global pool
+        return model.backbone.features.denseblock4
     if model_key == 'resnet':
-        return model.resnet.layer3[-1].conv3
-    return model.features[8]
+        # Final bottleneck block in layer4 (not layer3)
+        return model.resnet.layer4[-1]
+    # BaselineCNN: index 6 = Conv2d(64->128), the last conv before avgpool
+    return model.features[6]
 
 
 class GradCAM:
@@ -19,21 +26,30 @@ class GradCAM:
         self.model = model
         self.target_layer = target_layer
         self.feature_maps = None
+        self.gradients = None  # captured via backward hook (reliable for non-leaf tensors)
 
     def _forward_hook(self, module, input, output):
-        self.feature_maps = output
-        if isinstance(output, torch.Tensor) and torch.is_grad_enabled():
-            output.retain_grad()
+        if isinstance(output, torch.Tensor):
+            self.feature_maps = output
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        # grad_output[0] is the gradient w.r.t. the layer output
+        self.gradients = grad_output[0]
 
     def generate_heatmap(self, input_image, target_class=None):
         self.model.eval()
         self.feature_maps = None
+        self.gradients = None
 
-        handles = [self.target_layer.register_forward_hook(self._forward_hook)]
+        handles = [
+            self.target_layer.register_forward_hook(self._forward_hook),
+            self.target_layer.register_full_backward_hook(self._backward_hook),
+        ]
 
         try:
             input_image = input_image.detach().requires_grad_(True)
 
+            # Grad-CAM MUST run with gradients enabled — keep outside no_grad blocks
             with torch.enable_grad():
                 output = self.model(input_image)
 
@@ -44,15 +60,16 @@ class GradCAM:
                 score = output[0, target_class]
                 score.backward(retain_graph=False)
 
-            gradients = self.feature_maps.grad if self.feature_maps is not None else None
-
-            if gradients is None or self.feature_maps is None:
+            if self.gradients is None or self.feature_maps is None:
                 raise RuntimeError(
                     "Grad-CAM could not capture gradients. "
                     "Check that the target layer produces spatial feature maps."
                 )
 
             feature_maps = self.feature_maps.detach()
+            gradients = self.gradients.detach()
+
+            # Global average pool gradients to get neuron importance weights
             weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
             cam = torch.sum(weights * feature_maps, dim=1).squeeze(0)
 
@@ -68,8 +85,10 @@ class GradCAM:
     def _refine_cam(cam):
         """Upsample, smooth, and suppress background activations."""
         cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_CUBIC)
-        cam = cv2.GaussianBlur(cam, (0, 0), sigmaX=3)
-        floor = np.percentile(cam, 72)
+        # Reduced sigma from 3 -> 2 to preserve sharper fracture line detail
+        cam = cv2.GaussianBlur(cam, (0, 0), sigmaX=2)
+        # Reduced percentile from 72 -> 60 to show more activation area
+        floor = np.percentile(cam, 60)
         cam = np.clip(cam - floor, 0, None)
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
@@ -77,14 +96,14 @@ class GradCAM:
 
 
 def overlay_heatmap_on_rgb(rgb_img, heatmap, save_path=None, alpha=0.45):
-    """Overlay heatmap on an RGB uint8 image that matches the model input size."""
+    """Overlay heatmap on an RGB uint8 image."""
     if isinstance(rgb_img, np.ndarray):
         base = rgb_img.copy()
     else:
         base = np.array(rgb_img.convert('RGB'))
 
     heatmap_resized = cv2.resize(heatmap, (base.shape[1], base.shape[0]),
-                                  interpolation=cv2.INTER_CUBIC)
+                                 interpolation=cv2.INTER_CUBIC)
     heatmap_uint8 = np.uint8(255 * heatmap_resized)
     colormap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     colormap = cv2.cvtColor(colormap, cv2.COLOR_BGR2RGB)
@@ -106,7 +125,7 @@ def map_cam_to_original(cam_224, orig_w, orig_h):
 
 
 def overlay_heatmap(original_img_path, heatmap, save_path=None):
-    """Backward-compatible wrapper; prefers aligned overlay via overlay_heatmap_on_rgb."""
+    """Backward-compatible wrapper."""
     raw_img = cv2.imread(original_img_path)
     if raw_img is None:
         raise ValueError(f"Could not read image at {original_img_path}")
