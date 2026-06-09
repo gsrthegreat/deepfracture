@@ -1,4 +1,4 @@
-# FractureAI 🦴
+# DeepFractureAI 🦴
 
 Deep learning X-ray fracture detection with Grad-CAM heatmap visualisation.
 
