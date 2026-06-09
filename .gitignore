@@ -1,7 +1,8 @@
 .venv/
-data/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
 temp_*.jpg
-error_analysis_*/
 .DS_Store
+data/
