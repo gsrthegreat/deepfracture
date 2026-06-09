@@ -11,7 +11,7 @@ from gradcam import GradCAM, render_heatmap
 from preprocess import preprocess
 
 st.set_page_config(
-    page_title="FractureAI",
+    page_title="DeepFractureAI",
     page_icon="🦴",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -88,7 +88,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="header">
-  <h1>🦴 FractureAI</h1>
+  <h1>🦴 DeepFractureAI</h1>
   <p>Deep learning X-ray fracture detection with Grad-CAM visualisation</p>
 </div>
 """, unsafe_allow_html=True)
